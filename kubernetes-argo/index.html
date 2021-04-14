@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en-us" lang="en-us">
+<head>
+  <link href="https://gmpg.org/xfn/11" rel="profile">
+  <meta http-equiv="content-type" content="text/html; charset=utf-8">
+  <meta name="generator" content="Hugo 0.82.0" />
+
+  
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <title>Automating Bug Bounties using Kubernetes and Argo &middot; Th3 Alchem1st</title>
+  <meta name="description" content="" />
+
+  
+  <link type="text/css" rel="stylesheet" href="https://th3-alch3m1st.github.io/css/print.css" media="print">
+  <link type="text/css" rel="stylesheet" href="https://th3-alch3m1st.github.io/css/poole.css">
+  <link type="text/css" rel="stylesheet" href="https://th3-alch3m1st.github.io/css/syntax.css">
+  <link type="text/css" rel="stylesheet" href="https://th3-alch3m1st.github.io/css/hyde.css">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Abril+Fatface|PT+Sans:400,400i,700">
+
+
+  
+  <link rel="apple-touch-icon-precomposed" sizes="144x144" href="/apple-touch-icon-144-precomposed.png">
+  <link rel="shortcut icon" href="/favicon.png">
+
+  
+  
+</head>
+
+  <body class="theme-base-00 ">
+  <aside class="sidebar">
+  <div class="container sidebar-sticky">
+    <div class="sidebar-about">
+      <a href="https://th3-alch3m1st.github.io/"><h1>Th3 Alchem1st</h1></a>
+      <p class="lead">
+       Another Hacker&#39;s Site 
+      </p>
+    </div>
+
+    <nav>
+      <ul class="sidebar-nav">
+        <li><a href="https://th3-alch3m1st.github.io/">Home</a> </li>
+        <li><a href="https://github.com/th3-alch3m1st"> Github </a></li><li><a href="https://hackerone.com/th3_alchem1st"> Hackerone </a></li><li><a href="https://twitter.com/th3_alchem1st"> Twitter </a></li>
+      </ul>
+    </nav>
+
+    <p>&copy; 2021. All rights reserved. </p>
+  </div>
+</aside>
+
+    <main class="content container">
+    <div class="post">
+  <h1>Automating Bug Bounties using Kubernetes and Argo</h1>
+  <time datetime=2021-04-01T00:00:00Z class="post-date">Thu, Apr 1, 2021</time>
+  <p>I have experimented a lot trying to create fast and efficient workflows that would help me automate my recon process during bug hunting. At first using Python, RabbitMQ and Docker but I have now moved my whole process inside GKE using Kubernetes and Argo Events. I found out that using Argo I can easily pass data from one pod to another inside the workflow and also use RabbitMQ as a message queue.</p>
+<h2 id="argo-workflows--events">Argo Workflows &amp; Events</h2>
+<p><a href="https://argoproj.github.io/argo-events/">Argo Events</a> can help you automate your workflows inside Kubernetes and also offer a variety of events to trigger them like webhooks, message queues, etc. Personally I have only used webhooks and message queues using RabbitMQ. Both are very simple to use, the first one can be triggered by classic curl request and the latter using python&rsquo;s pika module or a quick golang program.</p>
+<h3 id="setting-up-argo-in-gcp">Setting up Argo in GCP</h3>
+<p>You can start by creating an account in <a href="https://cloud.google.com/">GCP</a> where you get a number of credits for the first 90 days of use, that should be enough for you to see if GCP and Argo are the right tools for your automation. You will also need to download <a href="https://cloud.google.com/sdk/gcloud">gcloud</a> and <a href="https://kubernetes.io/docs/tasks/tools/">kubectl</a>.</p>
+<p>Start by creating a project and selecting it to setup Argo inside it.</p>
+<pre><code>gcloud projects create bug-bounty-argo
+gcloud config set project bug-bounty-argo
+</code></pre><p>You will then need to create a cluster which you can do with:</p>
+<pre><code>gcloud container clusters create bug-bounty-argo --cluster-version 1.18.16-gke.300 --disk-size 200 --num-nodes 1 --machine-type e2-small --no-enable-cloud-logging --no-enable-cloud-monitoring --zone europe-west2-a
+</code></pre><p>With <code>kubectl</code> running locally you can run the commands below to access the cluster</p>
+<pre><code>gcloud container clusters get-credentials bug-bounty-argo --zone europe-west2-a
+kubectl get nodes
+</code></pre><h4 id="installing-argo-and-argo-events">Installing Argo and Argo Events</h4>
+<p>The fastest way to have a cluster with Argo installed is to run the below. However, I would first recommend you to go through the YAML files and understand what each one is doing.</p>
+<pre><code>kubectl create ns argo
+kubectl apply -n argo -f https://raw.githubusercontent.com/argoproj/argo-workflows/release-2.12.4/manifests/install.yaml
+</code></pre><p>Proceed with the Argo Events installation:</p>
+<pre><code>kubectl create namespace argo-events
+kubectl apply -f https://raw.githubusercontent.com/argoproj/argo-events/v1.2.3/manifests/install.yaml
+kubectl apply -n argo-events -f https://raw.githubusercontent.com/argoproj/argo-events/v1.2.3/examples/eventbus/native.yaml
+</code></pre><h4 id="example-argo-webhook-workflow">Example Argo Webhook Workflow</h4>
+<p>To see if everything is installed correctly and with no errors you can now setup a webhook event that will listen for events on port 12000. You will need to first setup the Event Source and Sensor:</p>
+<pre><code>kubectl apply -n argo-events -f https://raw.githubusercontent.com/argoproj/argo-events/stable/examples/event-sources/webhook.yaml
+kubectl apply -n argo-events -f https://raw.githubusercontent.com/argoproj/argo-events/stable/examples/sensors/webhook.yaml
+</code></pre><p>Once the Event Source and Sensor are running you can create a port forward on 12000 to listen to your messages.</p>
+<pre><code>kubectl -n argo-events port-forward $(kubectl -n argo-events get pod -l eventsource-name=webhook -o name) 12000:12000
+</code></pre><p>Finally, <code>curl</code> can be used to send a message:</p>
+<pre><code>curl -d '{&quot;message&quot;:&quot;this is my first webhook&quot;}' -H &quot;Content-Type: application/json&quot; -X POST http://localhost:12000/example
+</code></pre><p>You can now download the <a href="https://github.com/argoproj/argo-workflows/releases">Argo CLI</a> tool and use to submit workflows or view their process. For example:</p>
+<div class="highlight"><pre style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4"><code class="language-TEXT" data-lang="TEXT">argo list -n argo-events
+
+NAME            STATUS    AGE   DURATION   PRIORITY
+webhook-g2x8h   Running   0s    1s         0
+
+argo get -n argo-events @latest
+
+Name:                webhook-g2x8h
+Namespace:           argo-events
+Status:              Succeeded
+Conditions:          
+ Completed           True
+Progress:            1/1
+Parameters:          
+  message:           {&#34;context&#34;:{&#34;id&#34;:&#34;39663737663965312d383431622d346336622d613865662d323836346430366265386461&#34;,&#34;source&#34;:&#34;webhook&#34;,&#34;specversion&#34;:&#34;1.0&#34;,&#34;type&#34;:&#34;webhook&#34;,&#34;datacontenttype&#34;:&#34;application/json&#34;,&#34;subject&#34;:&#34;example&#34;,&#34;time&#34;:&#34;2021-04-12T16:50:48Z&#34;},&#34;data&#34;:&#34;eyJoZWFkZXIiOnsiQWNjZXB0IjpbIiovKiJdLCJDb250ZW50LUxlbmd0aCI6WyIzOCJdLCJDb250ZW50LVR5cGUiOlsiYXBwbGljYXRpb24vanNvbiJdLCJVc2VyLUFnZW50IjpbImN1cmwvNy42OC4wIl19LCJib2R5Ijp7Im1lc3NhZ2UiOiJ0aGlzIGlzIG15IGZpcnN0IHdlYmhvb2sifX0=&#34;}
+
+STEP              TEMPLATE  PODNAME        DURATION  MESSAGE
+ ✔ webhook-g2x8h  whalesay  webhook-g2x8h  24s         
+
+argo logs -n argo-events @latest
+
+webhook-g2x8h: / {&#34;context&#34;:{&#34;id&#34;:&#34;39663737663965312d383 \
+webhook-g2x8h: | 431622d346336622d613865662d323836346430 |
+webhook-g2x8h: | 366265386461&#34;,&#34;source&#34;:&#34;webhook&#34;,&#34;specv |
+webhook-g2x8h: | ersion&#34;:&#34;1.0&#34;,&#34;type&#34;:&#34;webhook&#34;,&#34;datacon |
+webhook-g2x8h: | tenttype&#34;:&#34;application/json&#34;,&#34;subject&#34;: |
+webhook-g2x8h: | &#34;example&#34;,&#34;time&#34;:&#34;2021-04-12T16:50:48Z&#34; |
+webhook-g2x8h: | },&#34;data&#34;:&#34;eyJoZWFkZXIiOnsiQWNjZXB0IjpbI |
+webhook-g2x8h: | iovKiJdLCJDb250ZW50LUxlbmd0aCI6WyIzOCJd |
+webhook-g2x8h: | LCJDb250ZW50LVR5cGUiOlsiYXBwbGljYXRpb24 |
+webhook-g2x8h: | vanNvbiJdLCJVc2VyLUFnZW50IjpbImN1cmwvNy |
+webhook-g2x8h: | 42OC4wIl19LCJib2R5Ijp7Im1lc3NhZ2UiOiJ0a |
+webhook-g2x8h: \ GlzIGlzIG15IGZpcnN0IHdlYmhvb2sifX0=&#34;}   /
+webhook-g2x8h:  ----------------------------------------- 
+[...]
+</code></pre></div><h3 id="setting-up-google-storage-for-argo">Setting up Google Storage for Argo</h3>
+<p>Argo supports Google Storage buckets that you can use to save your scan results. You will need to create a bucket first and then in order to set it up you need to create a secret to store the bucket&rsquo;s access and secret keys. For example, the contents of the <code>gcs-secret.yml</code> are shown below:</p>
+<div class="highlight"><pre style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4"><code class="language-YAML" data-lang="YAML"><span style="color:#f92672">apiVersion</span>: <span style="color:#ae81ff">v1</span>
+<span style="color:#f92672">kind</span>: <span style="color:#ae81ff">Secret</span>
+<span style="color:#f92672">metadata</span>:
+  <span style="color:#f92672">name</span>: <span style="color:#ae81ff">my-gcs-cred</span>
+<span style="color:#f92672">type</span>: <span style="color:#ae81ff">Opaque</span>
+<span style="color:#f92672">data</span>:
+  <span style="color:#f92672">accessKey</span>: <span style="color:#ae81ff">&lt;base64-access&gt;</span>
+  <span style="color:#f92672">secretKey</span>: <span style="color:#ae81ff">&lt;base64-secret&gt;</span>
+</code></pre></div><p>You will then need to create/edit the workflow controller on both namespaces to store the results in the bucket. You can do this with the below and store it to <code>workflow-controller-configmap.yml</code>:</p>
+<div class="highlight"><pre style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4"><code class="language-YAML" data-lang="YAML"><span style="color:#f92672">apiVersion</span>: <span style="color:#ae81ff">v1</span>
+<span style="color:#f92672">kind</span>: <span style="color:#ae81ff">ConfigMap</span>
+<span style="color:#f92672">metadata</span>:
+  <span style="color:#f92672">name</span>: <span style="color:#ae81ff">workflow-controller-configmap</span>
+<span style="color:#f92672">data</span>:
+  <span style="color:#f92672">artifactRepository</span>: |<span style="color:#e6db74">
+</span><span style="color:#e6db74">    s3:
+</span><span style="color:#e6db74">      bucket: bounty-argo-workflows
+</span><span style="color:#e6db74">      endpoint: storage.googleapis.com
+</span><span style="color:#e6db74">      insecure: true                  
+</span><span style="color:#e6db74">      accessKeySecret:               
+</span><span style="color:#e6db74">        name: my-gcs-cred
+</span><span style="color:#e6db74">        key: accessKey
+</span><span style="color:#e6db74">      secretKeySecret:           
+</span><span style="color:#e6db74">        name: my-gcs-cred
+</span><span style="color:#e6db74">        key: secretKey
+</span><span style="color:#e6db74">      useSDKCreds: false    </span>    
+</code></pre></div><p>Finally, apply changes in both namespaces:</p>
+<pre><code>kubectl -n argo apply -f workflow-controller-configmap.yaml
+kubectl -n argo-events apply -f workflow-controller-configmap.yaml
+</code></pre><h3 id="running-an-example-workflow">Running an Example Workflow</h3>
+<p>We can now write a workflow that will receive a domain to review and it will start by running httprobe. It will then store the results into a file but also in a JSON Array. The latter is required in order to split the results (if there are multiple ones) and pass them seperately into dirsearch. The next step will be to run httpx, nuclei and dirsearch in parallel.</p>
+<p>You can find the example below and others in my <a href="https://gitlab.com/th3alchem1st">Gitlab Repository</a>.</p>
+<div class="highlight"><pre style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4"><code class="language-YAML" data-lang="YAML"><span style="color:#f92672">apiVersion</span>: <span style="color:#ae81ff">argoproj.io/v1alpha1</span>
+<span style="color:#f92672">kind</span>: <span style="color:#ae81ff">Sensor</span>
+<span style="color:#f92672">metadata</span>:
+  <span style="color:#f92672">name</span>: <span style="color:#ae81ff">amqp</span>
+<span style="color:#f92672">spec</span>:
+  <span style="color:#f92672">template</span>:
+    <span style="color:#f92672">serviceAccountName</span>: <span style="color:#ae81ff">argo-events-sa</span>
+  <span style="color:#f92672">dependencies</span>:
+    - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">test-dep</span>
+      <span style="color:#f92672">eventSourceName</span>: <span style="color:#ae81ff">amqp</span>
+      <span style="color:#f92672">eventName</span>: <span style="color:#ae81ff">example</span>
+  <span style="color:#f92672">triggers</span>:
+    - <span style="color:#f92672">template</span>:
+        <span style="color:#f92672">name</span>: <span style="color:#ae81ff">amqp-workflow-trigger</span>
+        <span style="color:#f92672">k8s</span>:
+          <span style="color:#f92672">group</span>: <span style="color:#ae81ff">argoproj.io</span>
+          <span style="color:#f92672">version</span>: <span style="color:#ae81ff">v1alpha1</span>
+          <span style="color:#f92672">resource</span>: <span style="color:#ae81ff">workflows</span>
+          <span style="color:#f92672">operation</span>: <span style="color:#ae81ff">create</span>
+          <span style="color:#f92672">source</span>:
+            <span style="color:#f92672">resource</span>:
+              <span style="color:#f92672">apiVersion</span>: <span style="color:#ae81ff">argoproj.io/v1alpha1</span>
+              <span style="color:#f92672">kind</span>: <span style="color:#ae81ff">Workflow</span>
+              <span style="color:#f92672">metadata</span>:
+                <span style="color:#f92672">generateName</span>: <span style="color:#ae81ff">endpoints-</span>
+              <span style="color:#f92672">spec</span>:
+                <span style="color:#f92672">entrypoint</span>: <span style="color:#ae81ff">combo</span>
+                <span style="color:#f92672">serviceAccountName</span>: <span style="color:#ae81ff">argo-events-sa</span>
+    
+                <span style="color:#f92672">arguments</span>:
+                  <span style="color:#f92672">parameters</span>:
+                  - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">message</span>
+                    <span style="color:#f92672">value</span>:
+
+                <span style="color:#f92672">volumes</span>:
+                - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">webhook-volume</span>
+                  <span style="color:#f92672">persistentVolumeClaim</span>:
+                    <span style="color:#f92672">claimName</span>: <span style="color:#ae81ff">webhook-claim</span>
+      
+                <span style="color:#f92672">templates</span>:
+                - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">combo</span>
+                  <span style="color:#f92672">steps</span>:
+                  - - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">httprobe</span>
+                      <span style="color:#f92672">template</span>: <span style="color:#ae81ff">httprobe</span>
+                  - - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">httpx</span>
+                      <span style="color:#f92672">template</span>: <span style="color:#ae81ff">httpx</span>
+                      <span style="color:#f92672">arguments</span>:
+                        <span style="color:#f92672">artifacts</span>:
+                        - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">httprobe-results</span>
+                          <span style="color:#f92672">from</span>: <span style="color:#e6db74">&#34;{{steps.httprobe.outputs.artifacts.httprobe}}&#34;</span>
+                    - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">nuclei</span>
+                      <span style="color:#f92672">template</span>: <span style="color:#ae81ff">nuclei</span>
+                      <span style="color:#f92672">arguments</span>:
+                        <span style="color:#f92672">artifacts</span>:
+                        - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">httprobe-results</span>
+                          <span style="color:#f92672">from</span>: <span style="color:#e6db74">&#34;{{steps.httprobe.outputs.artifacts.httprobe}}&#34;</span>
+                    - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">dirsearch</span>
+                      <span style="color:#f92672">template</span>: <span style="color:#ae81ff">dirsearch</span>
+                      <span style="color:#f92672">arguments</span>:
+                        <span style="color:#f92672">parameters</span>:
+                        - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">target</span>
+                          <span style="color:#f92672">value</span>: <span style="color:#e6db74">&#34;{{item}}&#34;</span>
+                      <span style="color:#f92672">withParam</span>: <span style="color:#e6db74">&#34;{{steps.httprobe.outputs.parameters.livedomains}}&#34;</span>
+
+                - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">httprobe</span>
+                  <span style="color:#f92672">container</span>:
+                    <span style="color:#f92672">image</span>: <span style="color:#ae81ff">thealchemist11/tomnomnom-tools</span>
+                    <span style="color:#f92672">command</span>: [<span style="color:#ae81ff">sh, -c]</span>
+                    <span style="color:#f92672">args</span>: [<span style="color:#e6db74">&#34;echo {{workflow.parameters.message}} | httprobe -p 8080,https:8443,80,https:443 -c 150 -t 15000 &gt; /tmp/httprobe.txt; cat /tmp/httprobe.txt | jq -R . | jq -s . &gt; /tmp/httprobe.json&#34;</span>]
+                  <span style="color:#f92672">outputs</span>:
+                    <span style="color:#f92672">parameters</span>:
+                      - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">livedomains</span>
+                        <span style="color:#f92672">valueFrom</span>: 
+                          <span style="color:#f92672">path</span>: <span style="color:#ae81ff">/tmp/httprobe.json</span>
+                    <span style="color:#f92672">artifacts</span>:
+                    - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">httprobe</span>
+                      <span style="color:#f92672">path</span>: <span style="color:#ae81ff">/tmp/httprobe.txt</span>
+
+                - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">nuclei</span>
+                  <span style="color:#f92672">inputs</span>:
+                    <span style="color:#f92672">artifacts</span>:
+                    - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">httprobe-results</span>
+                      <span style="color:#f92672">path</span>: <span style="color:#ae81ff">/tmp/httprobe</span>
+                  <span style="color:#f92672">container</span>:
+                    <span style="color:#f92672">image</span>: <span style="color:#ae81ff">thealchemist11/nuclei</span>
+                    <span style="color:#f92672">command</span>: [<span style="color:#ae81ff">sh, -c]</span>
+                    <span style="color:#f92672">args</span>: [<span style="color:#e6db74">&#39;/tools/nuclei -l /tmp/httprobe -t /tools/nuclei-templates/cves/ -t /tools/nuclei-templates/technologies -silent -retries 3 -timeout 10 -o /tmp/nuclei.txt&#39;</span>]
+                  <span style="color:#f92672">outputs</span>:
+                    <span style="color:#f92672">artifacts</span>:
+                    - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">nuclei</span>
+                      <span style="color:#f92672">path</span>: <span style="color:#ae81ff">/tmp/nuclei.txt</span>
+
+                - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">httpx</span>
+                  <span style="color:#f92672">inputs</span>:
+                    <span style="color:#f92672">artifacts</span>:
+                    - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">httprobe-results</span>
+                      <span style="color:#f92672">path</span>: <span style="color:#ae81ff">/tmp/httprobe</span>
+                  <span style="color:#f92672">container</span>:
+                    <span style="color:#f92672">image</span>: <span style="color:#ae81ff">projectdiscovery/httpx</span>
+                    <span style="color:#f92672">command</span>: [<span style="color:#ae81ff">sh, -c]</span>
+                    <span style="color:#f92672">args</span>: [<span style="color:#e6db74">&#39;httpx -l /tmp/httprobe -retries 4 -title -content-length -status-code -follow-redirects -o /tmp/httpx.txt&#39;</span>]
+                  <span style="color:#f92672">outputs</span>:
+                    <span style="color:#f92672">artifacts</span>:
+                    - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">httpx</span>
+                      <span style="color:#f92672">path</span>: <span style="color:#ae81ff">/tmp/httpx.txt</span>
+
+                - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">dirsearch</span>
+                  <span style="color:#f92672">inputs</span>:
+                    <span style="color:#f92672">parameters</span>:
+                      - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">target</span>
+                  <span style="color:#f92672">container</span>:
+                    <span style="color:#f92672">image</span>: <span style="color:#ae81ff">jradik/dirsearch-docker</span>
+                    <span style="color:#f92672">command</span>: [<span style="color:#ae81ff">sh, -c]</span>
+                    <span style="color:#f92672">args</span>: [<span style="color:#e6db74">&#39;/root/dirsearch/dirsearch.py -u {{inputs.parameters.target}} -e .php,.js,.aspx -x 400,429,501,503,520 --plain-text-report=/tmp/dirsearch.txt&#39;</span>]
+                  <span style="color:#f92672">outputs</span>:
+                    <span style="color:#f92672">artifacts</span>:
+                    - <span style="color:#f92672">name</span>: <span style="color:#ae81ff">dirsearch</span>
+                      <span style="color:#f92672">path</span>: <span style="color:#ae81ff">/tmp/dirsearch.txt</span>
+
+          <span style="color:#f92672">parameters</span>:
+            - <span style="color:#f92672">src</span>:
+                <span style="color:#f92672">dependencyName</span>: <span style="color:#ae81ff">test-dep</span>
+                <span style="color:#f92672">dataKey</span>: <span style="color:#ae81ff">body.message</span>
+              <span style="color:#f92672">dest</span>: <span style="color:#ae81ff">spec.arguments.parameters.0.value</span>
+</code></pre></div><p>As this Argo Event is using AMQP we will need to setup a RabbitMQ pod together with the Event Source to listen and send messages to the queue. You can use the below:</p>
+<pre><code>kubectl -n argo-events apply -f https://raw.githubusercontent.com/argoproj/argo-events/master/examples/event-sources/amqp.yaml
+kubectl -n argo-events apply -f workflow.yaml
+</code></pre><p>Then create the RabbitMQ pod:</p>
+<div class="highlight"><pre style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4"><code class="language-YAML" data-lang="YAML"><span style="color:#f92672">apiVersion</span>: <span style="color:#ae81ff">v1</span>
+<span style="color:#f92672">kind</span>: <span style="color:#ae81ff">Service</span>
+<span style="color:#f92672">metadata</span>:
+  <span style="color:#f92672">labels</span>:
+    <span style="color:#f92672">component</span>: <span style="color:#ae81ff">rabbitmq</span>
+  <span style="color:#f92672">name</span>: <span style="color:#ae81ff">rabbitmq-service</span>
+<span style="color:#f92672">spec</span>:
+  <span style="color:#f92672">ports</span>:
+    - <span style="color:#f92672">port</span>: <span style="color:#ae81ff">5672</span>
+  <span style="color:#f92672">selector</span>:
+    <span style="color:#f92672">app</span>: <span style="color:#ae81ff">taskQueue</span>
+    <span style="color:#f92672">component</span>: <span style="color:#ae81ff">rabbitmq</span>
+---
+<span style="color:#f92672">apiVersion</span>: <span style="color:#ae81ff">v1</span>
+<span style="color:#f92672">kind</span>: <span style="color:#ae81ff">ReplicationController</span>
+<span style="color:#f92672">metadata</span>:
+  <span style="color:#f92672">labels</span>:
+    <span style="color:#f92672">component</span>: <span style="color:#ae81ff">rabbitmq</span>
+  <span style="color:#f92672">name</span>: <span style="color:#ae81ff">rabbitmq-controller</span>
+<span style="color:#f92672">spec</span>:
+  <span style="color:#f92672">replicas</span>: <span style="color:#ae81ff">1</span>
+  <span style="color:#f92672">template</span>:
+    <span style="color:#f92672">metadata</span>:
+      <span style="color:#f92672">labels</span>:
+        <span style="color:#f92672">app</span>: <span style="color:#ae81ff">taskQueue</span>
+        <span style="color:#f92672">component</span>: <span style="color:#ae81ff">rabbitmq</span>
+    <span style="color:#f92672">spec</span>:
+      <span style="color:#f92672">containers</span>:
+        - <span style="color:#f92672">image</span>: <span style="color:#ae81ff">rabbitmq</span>
+          <span style="color:#f92672">name</span>: <span style="color:#ae81ff">rabbitmq</span>
+          <span style="color:#f92672">ports</span>:
+            - <span style="color:#f92672">containerPort</span>: <span style="color:#ae81ff">5672</span>
+          <span style="color:#f92672">resources</span>:
+            <span style="color:#f92672">limits</span>:
+              <span style="color:#f92672">cpu</span>: <span style="color:#ae81ff">100m</span>
+</code></pre></div><p>Now apply the YAML file into the argo-events namespace:</p>
+<pre><code>kubectl -n argo-events apply -f rabbit.yaml
+</code></pre><p>Then locate the RabbitMQ Pod name and port forward on 5672:</p>
+<pre><code>kubectl -n argo-events get pods
+kubectl -n argo-events port-forward &lt;rabbitmq-pod-name&gt; 5672:5672
+</code></pre><p>A quick python script to help you trigger the workflow and send the domain to scan into RabbitMQ would be:</p>
+<div class="highlight"><pre style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4"><code class="language-Python" data-lang="Python"><span style="color:#f92672">import</span> pika
+
+f <span style="color:#f92672">=</span> open(<span style="color:#e6db74">&#39;./subdomains.txt&#39;</span>, <span style="color:#e6db74">&#39;r&#39;</span>)
+
+<span style="color:#66d9ef">for</span> subdomain <span style="color:#f92672">in</span> f:
+        sub <span style="color:#f92672">=</span> subdomain<span style="color:#f92672">.</span>rstrip()
+        <span style="color:#66d9ef">print</span> sub
+
+        connection <span style="color:#f92672">=</span> pika<span style="color:#f92672">.</span>BlockingConnection(pika<span style="color:#f92672">.</span>ConnectionParameters(<span style="color:#e6db74">&#39;localhost&#39;</span>))
+        channel <span style="color:#f92672">=</span> connection<span style="color:#f92672">.</span>channel()
+        channel<span style="color:#f92672">.</span>basic_publish(exchange<span style="color:#f92672">=</span><span style="color:#e6db74">&#39;test&#39;</span>, routing_key<span style="color:#f92672">=</span><span style="color:#e6db74">&#39;hello&#39;</span>, body<span style="color:#f92672">=</span><span style="color:#e6db74">&#39;{&#34;message&#34;: &#34;&#39;</span> <span style="color:#f92672">+</span> sub <span style="color:#f92672">+</span> <span style="color:#e6db74">&#39;&#34;}&#39;</span>)
+</code></pre></div><p>Now running a quick scan on uber.com and checking the workflow we have (also notice how argo split the two domains identified by httprobe and scheduled two dirsearch scans):</p>
+<div class="highlight"><pre style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4"><code class="language-TEXT" data-lang="TEXT">argo -n argo-events get @latest
+
+Name:                endpoints-btnkf
+Namespace:           argo-events
+ServiceAccount:      argo-events-sa
+Status:              Succeeded
+Conditions:          
+ Completed           True
+Duration:            1 hour 6 minutes
+Progress:            5/5
+ResourcesDuration:   4h19m31s*(1 cpu),4h19m31s*(100Mi memory)
+Parameters:          
+  message:           uber.com
+
+STEP                                  TEMPLATE   PODNAME                     DURATION  MESSAGE
+ ✔ endpoints-btnkf                    combo                                              
+ ├───✔ httprobe                       httprobe   endpoints-btnkf-3851781355  9s          
+ └─┬─✔ dirsearch(0:https://uber.com)  dirsearch  endpoints-btnkf-3047568844  1h          
+   ├─✔ dirsearch(1:http://uber.com)   dirsearch  endpoints-btnkf-1686601986  1h          
+   ├─✔ httpx                          httpx      endpoints-btnkf-2676845826  22s         
+   └─✔ nuclei                         nuclei     endpoints-btnkf-3145352274  1m          
+</code></pre></div><p>The scan results from all tools are stored in the bucket we created earlier:</p>
+<p><img src="/images/kubernetes-argo/storage-bucket-results.png" alt="Storage Bucket Results"></p>
+<p>All the above and the use of Argo showed us how easy you can run multiple tools and pass data between Pods, something that would potentially require a lot of lines of code to implement in bash or python.</p>
+
+</div>
+
+
+    </main>
+
+    
+      
+    
+  </body>
+</html>
